@@ -1,63 +1,53 @@
+use std::collections::HashMap;
+use actix::Message;
+use std::hash::Hash;
+
 pub mod trace_analyzer;
-pub mod metrics_collector;
-pub mod websocket_client;
-pub mod file_logger;
-pub mod prometheus_logger;
+pub mod pyroscope_exporter;
 
-use actix::{Message, Addr};
-use self::websocket_client::WebsocketClient;
+pub type FoldedStackTraces = HashMap<StackTrace, usize>;
 
-/// Signal new client connected to the `MetricsCollector` actor
-#[derive(Message)]
-#[rtype("()")]
-struct ClientConnected {
-    addr: Addr<WebsocketClient>
+#[derive(Eq)]
+pub struct StackTrace {
+    pub frames: Vec<&'static str>
 }
 
-/// Signal client disconnected to the `MetricsCollector` actor
-#[derive(Message)]
-#[rtype("()")]
-struct ClientDisconnected {
-    addr: Addr<WebsocketClient>
+// Compare frames' strings by reference as equal symbols would share a reference to the same
+// underlying static string
+impl PartialEq for StackTrace {
+    fn eq(&self, other: &Self) -> bool {
+        self.frames.len() == other.frames.len() &&
+        self.frames.iter().zip(other.frames.iter()).all(|(&a, &b)| std::ptr::eq(a, b))
+    }
 }
 
-/// Represents an update for a single metric on a single CPU
-/// from the `TraceAnalyzer` actor.
-#[derive(Message)]
-#[rtype("()")]
-struct MetricUpdate {
-    /// This is the hierarchical name of the metric.
-    /// For example, "RX softirq/Bridging".
-    name: &'static str,
-
-    /// CPU index this metric update is for
-    cpuid: usize,
-
-    /// Fraction of CPU time in the [0, 1] range
-    cpu_frac: f64
+// Also compute the hash against the pointer address of each stack frame
+impl Hash for StackTrace {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.frames.len());
+        for &frame in &self.frames {
+            (frame as *const str).hash(state);
+        }
+    }
 }
 
-/// Used to trigger the `MetricsCollector` to submit the update
-/// to all the clients.
-#[derive(Message, Clone)]
-#[rtype("()")]
-struct SubmitUpdate {
-    /// Power drawn by the CPU in the networking stack
-    /// as measured.
-    /// It's None if the RAPL interface isn't available.
-    net_power_w: Option<f64>,
-
-    /// Fraction of the CPU time spent by the user-space tool
-    user_space_overhead: f64,
-
-    /// Metrics acquired from /proc/stat for validation
-    procfs_metrics: Vec<f64>
-}
-
-/// Wrapper around a MessagePack buffer to send to websocket clients.
-/// This struct exists solely because Vec<u8> can't implement Message.
 #[derive(Message)]
 #[rtype("()")]
-struct EncodedUpdate {
-    inner: Vec<u8>
+pub struct FoldedStackTraceBatch {
+    pub traces: FoldedStackTraces
+}
+
+impl FoldedStackTraceBatch {
+    pub fn join_trace(&mut self, trace: StackTrace) -> Option<StackTrace> {
+        match self.traces.get_mut(&trace) {
+            Some(instances) => {
+                *instances += 1;
+                Some(trace)
+            },
+            None => {
+                self.traces.insert(trace, 1);
+                None
+            }
+        }
+    }
 }

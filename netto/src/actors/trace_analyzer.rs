@@ -1,21 +1,68 @@
-use std::time::{Duration, Instant};
+use std::{time::{Duration, Instant}, collections::HashMap};
 use actix::{Actor, Context, AsyncContext, Addr};
-use anyhow::anyhow;
-use libbpf_rs::MapFlags;
 use powercap::{IntelRapl, PowerCap};
 use tokio::sync::mpsc::Sender;
-use crate::{ksyms::{Counts, KSyms}, common::{event_types_EVENT_MAX, self, event_types_EVENT_SOCK_SENDMSG, event_types_EVENT_NET_TX_SOFTIRQ, event_types_EVENT_NET_RX_SOFTIRQ, event_types_EVENT_SOCK_RECVMSG, event_types_EVENT_IO_WORKER}, bpf::ProgSkel};
+use crate::{ksyms::KSyms, bpf::ProgSkel};
 use libc::{mmap, PROT_READ, MAP_SHARED, sysconf, _SC_CLK_TCK};
-use super::{metrics_collector::MetricsCollector, MetricUpdate, SubmitUpdate};
 #[cfg(feature = "save-traces")]
 use std::fs::File;
+use super::{pyroscope_exporter::PyroscopeExporter, FoldedStackTraceBatch, StackTrace};
+
+const USERSPACE_STR: &str = "Userspace";
+
+struct UserProcState {
+    pid: u32,
+    /// In seconds
+    user_time_prev: f64,
+    comm: &'static str
+}
+
+impl UserProcState {
+    fn new(pid: u32, clk_tck: f64) -> anyhow::Result<Self> {
+        let comm = {
+            let s = Self::stat_nth_entry(pid, 1)?;
+            let mut c = s.chars();
+            c.next();
+            c.next_back();
+            c.as_str().to_string()
+        };
+
+        let s = Self {
+            pid,
+            user_time_prev: Self::stat_nth_entry(pid, 13)?.parse::<u64>()? as f64 / clk_tck,
+            comm: comm.leak()
+        };
+
+        Ok(s)
+    }
+
+    fn stat_nth_entry(pid: u32, n: usize) -> anyhow::Result<String> {
+        let s = std::fs::read_to_string(format!("/proc/{}/stat", pid))?
+            .split_ascii_whitespace()
+            .nth(n)
+            .ok_or(anyhow::anyhow!("Unable to get nth stat entry, n = {n}"))?
+            .to_string();
+
+        Ok(s)
+    }
+    
+    fn user_time_delta(&mut self, clk_tck: f64) -> anyhow::Result<f64> {
+        let new = Self::stat_nth_entry(self.pid, 13)?
+            .parse::<u64>()? as f64 / clk_tck;
+
+        let delta = new - self.user_time_prev;
+        self.user_time_prev = new;
+
+        Ok(delta)
+    }
+}
 
 /// Actor responsible for interacting with BPF via shared maps,
 /// retrieve stack traces from the ring buffer, and analyze them
 /// to provide user-facing performance metrics.
 pub struct TraceAnalyzer {
-    /// User-space invocation period in ms
-    run_interval_ms: u64,
+    /// User-space invocation period
+    run_period: Duration,
 
     /// libbpf's skeleton
     skel: ProgSkel<'static>,
@@ -26,8 +73,8 @@ pub struct TraceAnalyzer {
     /// Half size of the `stack_traces` eBPF map in number of entries
     stack_traces_slot_size: u32,
 
-    /// Vec of one Counts for each CPU
-    counts: Vec<Counts>,
+    /// Maximum number of traces that could theoretically be recorded for each controller update period
+    max_traces: u32,
 
     /// Kernel symbols for processing the traces
     ksyms: KSyms,
@@ -35,31 +82,20 @@ pub struct TraceAnalyzer {
     /// Link to the open powercap interface for power queries
     rapl: Option<IntelRapl>,
 
-    /// USER_HZ for reading /proc/stat
-    ticks_per_second: f64,
-
-    procfs_metrics_old: Vec<i64>,
-
-    /// Addr of the `MetricsCollector` actor
-    metrics_collector_addr: Addr<MetricsCollector>,
-    
     /// Interface for sending unrecoverable runtime errors to the
     /// main task, triggering the program termination
     error_catcher_sender: Sender<anyhow::Error>,
 
-    // State-keeping fields
-
-    /// Timestamp of the previous update cycle.
-    /// Useful to calculate the delta-time.
-    prev_update_ts: Instant,
-
-    /// Total times up to the previous update cycle,
-    /// for each cpu for each event
-    prev_total_times: Vec<Vec<u64>>,
-
     /// Total energy, as reported by RAPL, up to the
     /// previous update cycle
     prev_total_energy: u64,
+
+    prev_update_ts: Instant,
+    pyroscope_exporter_actor_addr: Addr<PyroscopeExporter>,
+
+    num_possible_cpus: usize,
+    ticks_per_second: f64,
+    user_procs_state: Vec<UserProcState>,
 
     #[cfg(feature = "save-traces")]
     traces_output_buf: Vec<u8>
@@ -72,12 +108,14 @@ impl TraceAnalyzer {
     /// to be able to acquire it as an owned `libbpf_rs::Map` and
     /// avoid the reference to the lifetime of the main skel.
     pub fn new(
-        run_interval_ms: u64,
-        skel: ProgSkel<'static>,
+        run_period: Duration,
         num_possible_cpus: usize,
+        skel: ProgSkel<'static>,
         stack_traces_max_entries: u32,
-        metrics_collector_addr: Addr<MetricsCollector>,
-        error_catcher_sender: Sender<anyhow::Error>
+        max_traces: u32,
+        error_catcher_sender: Sender<anyhow::Error>,
+        pyroscope_exporter_actor_addr: Addr<PyroscopeExporter>,
+        user_pids: Vec<u32>
     ) -> anyhow::Result<Self> {
         let stack_traces_ptr = unsafe { mmap(
             std::ptr::null_mut(),
@@ -100,21 +138,26 @@ impl TraceAnalyzer {
             v as f64
         };
 
+        let user_procs_state = user_pids
+            .into_iter()
+            .filter_map(|pid| UserProcState::new(pid, ticks_per_second).ok())
+            .collect();
+
         Ok(Self {
-            run_interval_ms,
+            run_period,
             skel,
             stack_traces_ptr,
             stack_traces_slot_size: stack_traces_max_entries / 2,
-            counts: vec![Counts::default(); num_possible_cpus],
+            max_traces,
             ksyms: KSyms::load()?,
-            ticks_per_second,
-            procfs_metrics_old: vec![0; 10], // TODO: make this agnostic to the actual number of metrics in procfs
             rapl,
-            metrics_collector_addr,
             error_catcher_sender,
             prev_update_ts: Instant::now(),
-            prev_total_times: vec![vec![0;  event_types_EVENT_MAX as _]; num_possible_cpus],
             prev_total_energy: 0,
+            pyroscope_exporter_actor_addr,
+            num_possible_cpus,
+            ticks_per_second,
+            user_procs_state,
             #[cfg(feature = "save-traces")]
             traces_output_buf: vec![]
         })
@@ -131,7 +174,7 @@ impl TraceAnalyzer {
             self.prev_update_ts = now;
             dt
         };
-        let delta_energy = self.rapl.as_ref().map(|rapl| {
+        let _delta_energy = self.rapl.as_ref().map(|rapl| {
             let current_total_energy = rapl
                 .sockets
                 .values()
@@ -141,12 +184,11 @@ impl TraceAnalyzer {
             self.prev_total_energy = current_total_energy;
             delta_energy
         });
-        
-        // Reset counts to zero
-        for counts in &mut self.counts {
-            *counts = Counts::default();
-        }
 
+        let mut folded_stack_trace_batch = FoldedStackTraceBatch {
+            traces: HashMap::new()
+        };
+        
         // Drain the stack traces array
         {
             // Swap buffer slots and get the number of stack traces in the previously active slot
@@ -160,25 +202,60 @@ impl TraceAnalyzer {
 
             // Make sure to read the count *after* swapping the slots
             let num_traces = *num_traces_ref;
+            let num_traces = num_traces.min(self.stack_traces_slot_size as _);
+
+            // Estimate CPU consumption from user space processes by how many traces we didn't get compared to the requested number
+            // (note that this can potentially fail completely when the requested frequency is reduced automatically by Linux due
+            // to high CPU utilization)
+            let mut user_samples = (self.max_traces as i64 - num_traces as i64).max(0) as u64;
+
+            for u in &mut self.user_procs_state {
+                if let Ok(delta) = u.user_time_delta(self.ticks_per_second) {
+                    let max_traces_per_cpu = self.max_traces as f64 / self.num_possible_cpus as f64;
+                    let num_proc_traces = (delta * max_traces_per_cpu / delta_time.as_secs_f64()) as u64;
+                    user_samples = user_samples.saturating_sub(num_proc_traces);
+
+                    folded_stack_trace_batch.traces.insert(StackTrace {
+                        frames: vec![&u.comm, USERSPACE_STR]
+                    }, num_proc_traces as _);
+                }
+            }
+            
+            folded_stack_trace_batch.traces.insert(StackTrace {
+                frames: vec![USERSPACE_STR]
+            }, user_samples as _);
+            
+            let mut trace_buf: Option<StackTrace> = None;
 
             // Count symbols
             unsafe {
                 for trace_ptr in (0..num_traces as usize).map(|trace_idx| self.stack_traces_ptr.add((slot_off + trace_idx) * 128 /* size of a single trace */)) {
                     // Get the cpuid
-                    let (trace_size, cpuid) = {
+                    let (trace_size, _cpuid) = {
                         let v = trace_ptr.read_volatile();
 
                         // Note that the trace size is encoded in bytes in the map, but we care about number of u64s
                         (v >> 35, v & 0xFFFFFFFF)
                     };
 
-                    self.counts[cpuid as usize].acc_trace(
-                        &self.ksyms,
+                    if let Some(trace) = trace_buf.as_mut() {
+                        trace.frames.clear();
+                    }
+
+                    let idle = self.ksyms.eval_trace(
                         trace_ptr.add(1),
                         trace_size as _,
-                        #[cfg(feature = "save-traces")]
-                        &mut self.traces_output_buf
+                        trace_buf.get_or_insert_with(|| StackTrace {
+                            frames: Vec::with_capacity(8)
+                        })
                     );
+                    
+                    let mut trace = trace_buf.take().unwrap(); // Cannot fail
+                    if !idle {
+                        trace.frames.push("Kernel");
+                    }
+
+                    trace_buf = folded_stack_trace_batch.join_trace(trace);
                 }
             }
 
@@ -186,168 +263,8 @@ impl TraceAnalyzer {
             *num_traces_ref = 0;
         }
 
-        // Get a reference to the counts
-        let counts = &self.counts;
-
-        // Lookup in the per-cpu map
-        let stats = self.skel.maps().per_cpu()
-            .lookup_percpu(&0i32.to_le_bytes(), MapFlags::empty())?
-            .ok_or(anyhow!("Unexpected None returned for lookup into the \"per_cpu\" map"))?;
-        
-        let total_cpu_frac = stats
-            .iter()
-            .zip(self.prev_total_times.iter_mut())
-            .enumerate()
-            .map(|(cpuid, (cpu_stats, prev_total_cpu_times))| {
-                unsafe {
-                    // Read the data as unaligned because we do not have any alignment guarantees at this point
-                    (cpu_stats.as_ptr() as *const common::per_cpu_data).read_unaligned()
-                }.per_event_total_time
-                    .iter()
-                    .zip(prev_total_cpu_times.iter_mut())
-                    .enumerate()
-                    .map(|(event_idx, (total_time, prev_total_time))| {
-                        let delta_cpu_time = total_time - *prev_total_time;
-                        *prev_total_time = *total_time;
-                        let cpu_frac = (delta_cpu_time as f64) / (delta_time.as_nanos() as f64);
-
-                        #[allow(non_upper_case_globals)]
-                        let metric_name = match event_idx as u32 {
-                            event_types_EVENT_SOCK_SENDMSG   => "TX syscalls",
-                            event_types_EVENT_SOCK_RECVMSG   => "RX syscalls",
-                            event_types_EVENT_NET_TX_SOFTIRQ => "TX softirq",
-                            event_types_EVENT_IO_WORKER      => "IO workers",
-                            event_types_EVENT_NET_RX_SOFTIRQ => {
-                                // Update sub-events
-                                let denominator = counts[cpuid].net_rx_action.max(1) as f64;
-                                
-                                // Driver poll
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/Driver poll",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * (counts[cpuid].__napi_poll - counts[cpuid].netif_receive_skb) as f64 / denominator
-                                });
-
-                                // GRO overhead
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/GRO overhead",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].napi_gro_receive_overhead as f64 / denominator
-                                });
-
-                                // XDP generic
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/XDP generic",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].do_xdp_generic as f64 / denominator
-                                });
-
-                                // TC classify
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/TC classify",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].tcf_classify as f64 / denominator
-                                });
-
-                                // NF ingress
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/NF ingress",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].nf_netdev_ingress as f64 / denominator
-                                });
-
-                                // Conntrack
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/NF conntrack",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].nf_conntrack_in as f64 / denominator
-                                });
-
-                                // Bridging
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/Bridging",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * (counts[cpuid].br_handle_frame - counts[cpuid].netif_receive_skb_sub_br) as f64 / denominator
-                                });
-
-                                // NF prerouting
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/NF prerouting/v4",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].nf_prerouting_v4 as f64 / denominator
-                                });
-
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/NF prerouting/v6",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].nf_prerouting_v6 as f64 / denominator
-                                });
-
-                                // Forwarding
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/Forwarding/v4",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].ip_forward as f64 / denominator
-                                });
-
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/Forwarding/v6",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].ip6_forward as f64 / denominator
-                                });
-
-                                // Local deliver
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/Local delivery/v4",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].ip_local_deliver as f64 / denominator
-                                });
-
-                                self.metrics_collector_addr.do_send(MetricUpdate {
-                                    name: "RX softirq/Local delivery/v6",
-                                    cpuid,
-                                    cpu_frac: cpu_frac * counts[cpuid].ip6_input as f64 / denominator
-                                });
-
-                                "RX softirq"
-                            },
-                            _ => unreachable!()
-                        };
-
-                        self.metrics_collector_addr.do_send(MetricUpdate {
-                            name: metric_name,
-                            cpuid,
-                            cpu_frac
-                        });
-
-                        cpu_frac
-                    })
-                    .sum::<f64>()
-            })
-            .sum::<f64>() / (self.prev_total_times.len() as f64);
-
-        // Collect /proc/stat metrics
-        let procfs_metrics = std::fs::read_to_string("/proc/stat")?
-            .lines()
-            .take(1)
-            .flat_map(|s| {
-                s.split_ascii_whitespace()
-                    .skip(1)
-                    .map(|s| s.parse::<i64>().unwrap())
-            })
-            .zip(self.procfs_metrics_old.iter_mut())
-            .map(|(curr, old)| {
-                let delta = curr - *old;
-                *old = curr;
-                (delta as f64) / (self.ticks_per_second * delta_time.as_secs_f64())
-            })
-            .collect::<Vec<_>>();
-
-        self.metrics_collector_addr.do_send(SubmitUpdate {
-            net_power_w: delta_energy.map(|e| (e as f64) * total_cpu_frac / (delta_time.as_secs_f64() * 1_000_000.0)),
-            user_space_overhead: now.elapsed().as_secs_f64() / delta_time.as_secs_f64(),
-            procfs_metrics
-        });
+        // Send extracted traces to the pyroscope exporter actor
+        self.pyroscope_exporter_actor_addr.do_send(folded_stack_trace_batch);
 
         Ok(())
     }
@@ -357,7 +274,7 @@ impl Actor for TraceAnalyzer {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        ctx.run_interval(Duration::from_millis(self.run_interval_ms), |act, _| {
+        ctx.run_interval(self.run_period, |act, _| {
             if let Err(e) = act.run_interval() {
                 act.error_catcher_sender.blocking_send(e).unwrap();
             }
