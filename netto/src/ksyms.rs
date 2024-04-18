@@ -57,7 +57,7 @@ impl KSyms {
                     "nf_conntrack_in"              => Some("NetFilter Conntrack"),
    
                     "sock_recvmsg"                 => Some("sock_recvmsg"),
-                    "sock_sendmsg"                 => Some("sock_sendmsg"),
+                    "__sock_sendmsg"                 => Some("sock_sendmsg"),
                     
                     "syscall_enter_from_user_mode" => Some("Syscall entry overhead"),
                     "syscall_exit_to_user_mode"    => Some("Syscall exit overhead"),
