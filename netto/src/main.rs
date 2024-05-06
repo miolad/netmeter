@@ -26,12 +26,12 @@ struct Cli {
     #[arg(short, long, default_value_t = 1000)]
     frequency: u64,
 
-    /// Bind address or hostname for the web frontend
-    #[arg(short, long, default_value = "0.0.0.0")]
+    /// Address of the Grafana Pyroscope backend
+    #[arg(short, long, default_value = "pyroscope")]
     address: String,
 
-    /// Bind port for the web frontend
-    #[arg(short, long, default_value_t = 8080)]
+    /// Port for the Grafana Pyroscope backend to listen on
+    #[arg(short, long, default_value_t = 4040)]
     port: u16,
 
     /// User-space controller update period in ms
@@ -123,7 +123,7 @@ fn main() -> anyhow::Result<()> {
             channel::<anyhow::Error>(1);
 
         let pyroscope_exporter_actor_addr = PyroscopeExporter::new(
-            "http://localhost:4040".to_string(), // TODO: make configurable
+            format!("http://{}:{}", cli.address, cli.port),
             Duration::from_secs(5),
             error_catcher_sender.clone(),
             tokio::runtime::Handle::current(),
