@@ -26,11 +26,11 @@ struct Cli {
     #[arg(short, long, default_value_t = 1000)]
     frequency: u64,
 
-    /// Bind address or hostname for the web frontend
+    /// Address of the Grafana Pyroscope backend
     #[arg(short, long, default_value = "pyroscope")]
     address: String,
 
-    /// Bind port for the web frontend
+    /// Port for the Grafana Pyroscope backend to listen on
     #[arg(short, long, default_value_t = 4040)]
     port: u16,
 
