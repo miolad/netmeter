@@ -11,7 +11,8 @@ pub struct PyroscopeExporter {
     async_runtime_handle: tokio::runtime::Handle,
     http_client: reqwest::Client,
     last_invocation_unix_time: u64,
-    sample_rate: u64
+    sample_rate: u64,
+    application_name: String
 }
 
 impl PyroscopeExporter {
@@ -23,6 +24,16 @@ impl PyroscopeExporter {
         sample_rate: u64,
         num_possible_cpus: u64
     ) -> anyhow::Result<Self> {
+        // Used to distinguish individual instances in a multi-host deployment
+        let netto_host = std::env::var("NETTO_HOST");
+
+        // Embed tags into the application name
+        let application_name = String::from("netto") + &if let Ok(host) = netto_host {
+            format!("{{host={host}}}")
+        } else {
+            String::new()
+        };
+
         Ok(Self {
             endpoint,
             run_period,
@@ -31,7 +42,8 @@ impl PyroscopeExporter {
             async_runtime_handle: async_runtime,
             http_client: reqwest::Client::new(),
             last_invocation_unix_time: UNIX_EPOCH.elapsed()?.as_secs(),
-            sample_rate: sample_rate * num_possible_cpus
+            sample_rate: sample_rate * num_possible_cpus,
+            application_name
         })
     }
     
@@ -55,11 +67,12 @@ impl PyroscopeExporter {
         let until: u64 = UNIX_EPOCH.elapsed().unwrap().as_secs();
         self.last_invocation_unix_time = until;
         let sample_rate = self.sample_rate;
+        let application_name = self.application_name.clone();
 
         self.async_runtime_handle.spawn(async move {
             if let Err(e) = client.post(endpoint + "/ingest")
                 .query(&[
-                    ("name", "netto"),
+                    ("name", application_name.as_str()),
                     ("spyName", "netto"),
                     ("from", &format!("{}", from)),
                     ("until", &format!("{}", until)),
